@@ -87,16 +87,24 @@ def ensure_secret(kube):
     kube.run("apply", "-f", "-", input_text=json.dumps(manifest))
 
 
-def pod_manifest(name, image):
+def pod_manifest(name, image, node_pool=None, toleration=None):
+    selector = {"cloud.google.com/gke-tpu-accelerator": "tpu-v6e-slice",
+                "cloud.google.com/gke-tpu-topology": "1x1"}
+    if node_pool:
+        selector["cloud.google.com/gke-nodepool"] = node_pool
+    tolerations = [{"key": "google.com/tpu", "operator": "Exists", "effect": "NoSchedule"}]
+    if toleration:  # KEY=VALUE:EFFECT, e.g. jaxbench-original=true:NoSchedule
+        kv, effect = toleration.rsplit(":", 1)
+        k, v = kv.split("=", 1)
+        tolerations.append({"key": k, "operator": "Equal", "value": v, "effect": effect})
     return {
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "labels": {"app": "jaxbench-parity-original"}},
         "spec": {
             "restartPolicy": "Never",
             "terminationGracePeriodSeconds": 5,
-            "nodeSelector": {"cloud.google.com/gke-tpu-accelerator": "tpu-v6e-slice",
-                             "cloud.google.com/gke-tpu-topology": "1x1"},
-            "tolerations": [{"key": "google.com/tpu", "operator": "Exists", "effect": "NoSchedule"}],
+            "nodeSelector": selector,
+            "tolerations": tolerations,
             "containers": [{
                 "name": "main", "image": image, "command": ["sleep", "infinity"],
                 "resources": {"requests": {"cpu": "8", "memory": "32Gi", "google.com/tpu": "1"},
@@ -132,7 +140,7 @@ def wait_for(kube, pod, cond, timeout, what):
     raise TimeoutError(f"timed out after {timeout}s waiting for {what}")
 
 
-def run_one(kube, image, workload, workload_dir, out_dir):
+def run_one(kube, image, workload, workload_dir, out_dir, node_pool=None, toleration=None):
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     pod = f"jbo-{workload.lower().replace('_', '-')[:40]}-{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -149,7 +157,7 @@ def run_one(kube, image, workload, workload_dir, out_dir):
         for f in ("instruction_template.md", "mini_config.yaml", "run_agent.sh"):
             shutil.copy2(HERE / f, parity / f)
 
-        kube.run("apply", "-f", "-", input_text=json.dumps(pod_manifest(pod, image)))
+        kube.run("apply", "-f", "-", input_text=json.dumps(pod_manifest(pod, image, node_pool, toleration)))
         try:
             wait_for(kube, pod, lambda ph: ph == "Running", POD_READY_TIMEOUT, "pod Running")
             kube.exec(pod, "mkdir -p /workspace /opt/parity /results")
@@ -196,6 +204,10 @@ def main():
     ap.add_argument("--context", required=True, help="kubectl context of the GKE cluster with the v6e node")
     ap.add_argument("--namespace", default="default")
     ap.add_argument("--image", required=True, help="image built from JAXBench/harbor_parity/Dockerfile")
+    ap.add_argument("--node-pool", default=None,
+                    help="pin pods to this GKE node pool (keeps them off the Harbor side's node)")
+    ap.add_argument("--toleration", default=None,
+                    help="extra toleration KEY=VALUE:EFFECT for a tainted dedicated pool")
     ap.add_argument("--workloads", default=str(HERE / "parity_workloads.txt"))
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--retries", type=int, default=3, help="retries per run when the pod/node disappears")
@@ -219,7 +231,8 @@ def main():
             reward = None
             for attempt in range(args.retries + 1):
                 try:
-                    reward = run_one(kube, args.image, w, Path(get_workload_dir(w)), out_dir)
+                    reward = run_one(kube, args.image, w, Path(get_workload_dir(w)), out_dir,
+                                     args.node_pool, args.toleration)
                     break
                 except (PodGone, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as e:
                     log(f"run {run} {w}: attempt {attempt + 1} failed: {e}")

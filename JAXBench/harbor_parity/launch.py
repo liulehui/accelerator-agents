@@ -214,7 +214,8 @@ def main():
     ap.add_argument("--out", default="parity_results/original")
     args = ap.parse_args()
 
-    from JAXBench.benchmark import get_workload_dir  # noqa: E402  (run from the repo root)
+    sys.path.insert(0, str(JAXBENCH.parent))  # repo root, so JAXBench is importable however this is run
+    from JAXBench.benchmark import get_workload_dir  # noqa: E402
 
     kube = Kube(args.context, args.namespace)
     ensure_secret(kube)

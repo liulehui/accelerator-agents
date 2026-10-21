@@ -1,0 +1,8 @@
+# mini-swe-agent overrides layered over its builtin `mini` config (identical to the Harbor adapter's
+# run_jaxbench_gke_tpu_v6e_parity.yaml `config`). DeepSeek V4.1 Flash recommended sampling.
+agent:
+  step_limit: 150
+model:
+  model_kwargs:
+    temperature: 1.0
+    top_p: 0.95

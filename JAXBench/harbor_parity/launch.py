@@ -44,8 +44,14 @@ HARNESS_FILES = [
 SECRET = "jaxbench-parity-llm"
 BASE_URL = "https://app-us.ppapi.ai/v1"
 POD_READY_TIMEOUT = 1200   # Harbor's TPU pod-ready allowance
-AGENT_PHASE_TIMEOUT = 3600 + 1800  # agent limit (enforced in-pod) + generous install/slack
+AGENT_LIMIT = 3600         # agent time limit (same as the Harbor task's [agent] timeout_sec)
+AGENT_GRACE = 120          # launcher enforces AGENT_LIMIT + this, in case the in-pod timeout is defeated
+SETUP_TIMEOUT = 1800       # agent install must finish within this
 VERIFY_TIMEOUT = 1800 + 300
+
+# Shell snippets run inside the pod (the image has no ps/pkill).
+FIND_PROCS = ("for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); "
+              "case \"$c\" in *{pat}*) echo ${{p#/proc/}};; esac; done")
 
 
 def log(msg):
@@ -140,6 +146,46 @@ def wait_for(kube, pod, cond, timeout, what):
     raise TimeoutError(f"timed out after {timeout}s waiting for {what}")
 
 
+def pod_pids(kube, pod, pattern):
+    # Split the pattern with "" so this scanner's own command line never matches it.
+    quoted = pattern[:3] + '""' + pattern[3:]
+    r = kube.exec(pod, FIND_PROCS.format(pat=quoted), check=False)
+    return [x for x in r.stdout.split() if x.isdigit()]
+
+
+def wait_agent(kube, pod):
+    """Wait for the agent phase like Harbor: it ends at the agent's own exit or at the time limit.
+
+    Returns how it ended: "done" (run_agent.sh finished), "limit" (launcher stopped the agent at
+    AGENT_LIMIT + AGENT_GRACE), or "script_gone" (run_agent.sh disappeared without finishing, e.g. the
+    agent killed it). In every case the caller goes on to grade whatever /workspace/kernel.py exists.
+    """
+    t0, t_agent = time.time(), None
+    while True:
+        if not kube.alive(pod):
+            raise PodGone(f"pod {pod} is {kube.phase(pod) or 'gone'} during the agent phase")
+        if kube.exec(pod, "test -f /results/AGENT_DONE", check=False).returncode == 0:
+            return "done"
+        if t_agent is None and kube.exec(pod, "test -f /results/agent_started_at", check=False).returncode == 0:
+            t_agent = time.time()
+        if t_agent is None and time.time() - t0 > SETUP_TIMEOUT:
+            raise TimeoutError(f"agent setup did not finish within {SETUP_TIMEOUT}s")
+        if t_agent is not None:
+            if time.time() - t_agent > AGENT_LIMIT + AGENT_GRACE:
+                for pid in pod_pids(kube, pod, "mini-swe-agent") + pod_pids(kube, pod, "run_agent.sh"):
+                    kube.exec(pod, f"kill -9 {pid}", check=False)
+                kube.exec(pod, "echo launcher_limit > /results/agent_exit; date -u +%FT%TZ > /results/agent_finished_at",
+                          check=False)
+                return "limit"
+            if not pod_pids(kube, pod, "run_agent.sh"):
+                time.sleep(5)  # it may have just finished
+                if kube.exec(pod, "test -f /results/AGENT_DONE", check=False).returncode == 0:
+                    return "done"
+                kube.exec(pod, "echo script_gone > /results/agent_exit", check=False)
+                return "script_gone"
+        time.sleep(30)
+
+
 def run_one(kube, image, workload, workload_dir, out_dir, node_pool=None, toleration=None):
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     pod = f"jbo-{workload.lower().replace('_', '-')[:40]}-{suffix}"
@@ -166,10 +212,9 @@ def run_one(kube, image, workload, workload_dir, out_dir, node_pool=None, tolera
 
             log(f"{workload}: agent phase on {pod}")
             kube.exec(pod, f"nohup bash /opt/parity/run_agent.sh {workload} > /results/run_agent.out 2>&1 &")
-            wait_for(kube, pod, lambda ph: kube.exec(pod, "test -f /results/AGENT_DONE", check=False).returncode == 0,
-                     AGENT_PHASE_TIMEOUT, "agent phase")
+            timing["agent_end"] = wait_agent(kube, pod)
 
-            log(f"{workload}: verifier phase")
+            log(f"{workload}: verifier phase (agent ended: {timing['agent_end']})")
             kube.exec(pod, "mkdir -p /grader")
             kube.run("cp", f"{grader}/.", f"{pod}:/grader")
             r = kube.exec(pod, f"bash /grader/run_verify.sh {workload}", timeout=VERIFY_TIMEOUT, check=False)
@@ -177,6 +222,12 @@ def run_one(kube, image, workload, workload_dir, out_dir, node_pool=None, tolera
             if not kube.alive(pod):
                 raise PodGone(f"pod {pod} disappeared during verification")
             kube.run("cp", f"{pod}:/results/.", str(out_dir), timeout=900)
+        except BaseException:
+            # Keep whatever the failed attempt produced, for diagnosis (best effort).
+            failed = out_dir.parent / f"{out_dir.name}.failed-{suffix}"
+            failed.mkdir(parents=True, exist_ok=True)
+            kube.run("cp", f"{pod}:/results/.", str(failed), check=False, timeout=900)
+            raise
         finally:
             kube.run("delete", "pod", pod, "--wait=false", check=False)
     timing["finished_at"] = time.strftime("%FT%T")

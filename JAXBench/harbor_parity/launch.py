@@ -236,15 +236,16 @@ def run_one(kube, image, workload, workload_dir, out_dir, node_pool=None, tolera
 
 
 def summarize(results):
-    v = [r for r in results if r.get("reward") is not None]
-    n = len(v)
+    """Aggregate like the Harbor side: a task with no reward (every attempt failed) counts as incorrect, 1x."""
+    n = len(results)
     if not n:
         return {"n_tasks": 0}
-    floored = [max(float(r["reward"]), 1.0) for r in v]
+    floored = [max(float(r["reward"]), 1.0) if r.get("reward") is not None else 1.0 for r in results]
     return {
         "n_tasks": n,
-        "correct_rate": sum(int(r["correct"]) for r in v) / n,
-        "fast_1_rate": sum(int(r["fast_1"]) for r in v) / n,
+        "n_no_result": sum(r.get("reward") is None for r in results),
+        "correct_rate": sum(int(r.get("correct") or 0) for r in results) / n,
+        "fast_1_rate": sum(int(r.get("fast_1") or 0) for r in results) / n,
         "geomean_speedup": math.exp(sum(math.log(x) for x in floored) / n),
         "mean_reward": sum(floored) / n,
     }

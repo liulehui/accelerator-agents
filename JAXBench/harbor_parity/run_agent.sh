@@ -33,15 +33,19 @@ echo "$SETUP_EXIT" > "$RESULTS/agent_setup_exit"
 if [ "$SETUP_EXIT" -ne 0 ]; then echo "setup failed" > "$RESULTS/AGENT_DONE"; exit 0; fi
 export PATH="$HOME/.local/bin:$PATH"
 
-# Agent run: same environment and flags as Harbor's mini-swe-agent agent.
+# Agent run: same environment and flags as Harbor's mini-swe-agent agent (Harbor also sends a per-trial
+# X-Session-ID header to the model API).
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:?}" OPENAI_API_BASE="${OPENAI_BASE_URL}"
 export MSWEA_CONFIGURED=true MSWEA_COST_TRACKING=ignore_errors
 cd /workspace
 date -u +%FT%TZ > "$RESULTS/agent_started_at"
+# Harbor passes the instruction file verbatim (including its trailing newline); $(cat) would strip it.
+TASK="$(cat /opt/parity/instruction.md; printf x)"; TASK="${TASK%x}"
 timeout --signal=KILL 3600 mini-swe-agent --yolo --model=openai/deepseek-v4.1-flash \
-  --task="$(cat /opt/parity/instruction.md)" \
+  --task="$TASK" \
   --output="$RESULTS/mini-swe-agent.trajectory.json" --cost-limit 0 \
   -c mini -c model.model_kwargs.timeout=3600 -c /opt/parity/mini_config.yaml \
+  -c "model.model_kwargs.extra_headers.X-Session-ID=${WORKLOAD}__${HOSTNAME}__agent" \
   --exit-immediately < /dev/null > "$RESULTS/mini-swe-agent.txt" 2>&1
 AGENT_EXIT=$?
 date -u +%FT%TZ > "$RESULTS/agent_finished_at"

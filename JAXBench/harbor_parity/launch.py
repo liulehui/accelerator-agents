@@ -113,7 +113,8 @@ def pod_manifest(name, image, node_pool=None, toleration=None):
             "tolerations": tolerations,
             "containers": [{
                 "name": "main", "image": image, "command": ["sleep", "infinity"],
-                "resources": {"requests": {"cpu": "8", "memory": "32Gi", "google.com/tpu": "1"},
+                "resources": {"requests": {"cpu": "8", "memory": "32Gi", "ephemeral-storage": "20Gi",
+                                           "google.com/tpu": "1"},
                               "limits": {"google.com/tpu": "1"}},
                 "env": [{"name": "OPENAI_BASE_URL", "value": BASE_URL},
                         {"name": "OPENAI_API_KEY",

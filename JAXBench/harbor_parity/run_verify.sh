@@ -34,12 +34,19 @@ done
 sleep 2
 
 cd /grader
-timeout 1800 python -m JAXBench evaluate \
-  --workload "$WORKLOAD" \
-  --kernel "$KERNEL" \
-  --tpu v6e \
-  --json > "$RESULT"
-echo "JAXBench evaluate exit code: $?"
+# A killed process can keep the TPU busy for a few seconds while the device is released, so
+# retry (without changing the kernel) while the evaluator reports the TPU as busy.
+for attempt in 1 2 3 4 5 6; do
+  timeout 1800 python -m JAXBench evaluate \
+    --workload "$WORKLOAD" \
+    --kernel "$KERNEL" \
+    --tpu v6e \
+    --json > "$RESULT"
+  echo "JAXBench evaluate exit code: $?"
+  grep -q "Device or resource busy" "$RESULT" || break
+  echo "TPU still busy (attempt $attempt); retrying in 10 s"
+  sleep 10
+done
 cat "$RESULT"
 
 python /grader/compute_reward.py "$RESULT" "$RESULTS/reward.json"
